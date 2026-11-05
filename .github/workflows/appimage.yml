@@ -1,0 +1,294 @@
+name: AppImage
+
+# Builds qutaq-webapps AppImages for x86_64 and aarch64. Self-contained:
+# everything needed for packaging is in this file.
+#
+# - every push / pull request: AppImages are attached to the run as artifacts;
+# - a pushed tag v* (e.g. v1.0.0): AppImages are also published to a GitHub Release.
+#
+# The build runs inside a pinned ubuntu:24.04 container, not directly on the
+# runner VM: the base system decides the minimal glibc of the AppImage (2.38),
+# so it must not change silently when GitHub updates "ubuntu-latest" or
+# retires runner images. Result runs on Ubuntu 24.04+, Mint 22+, Debian 13+,
+# Fedora 39+, openSUSE Tumbleweed, Arch…
+#
+# Qt and its dependencies are bundled by the steps below (no linuxdeploy);
+# the image is made with mksquashfs + the official type2 AppImage runtime.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: appimage-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: AppImage ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm   # native arm64 runner (free for public repos)
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: ubuntu:24.04
+
+    defaults:
+      run:
+        shell: bash
+
+    env:
+      ARCH: ${{ matrix.arch }}
+      DEBIAN_FRONTEND: noninteractive
+      APPDIR: ${{ github.workspace }}/build-appimage/AppDir
+      BUILD_DIR: ${{ github.workspace }}/build-appimage
+      OUT_DIR: ${{ github.workspace }}/dist
+
+    steps:
+      # git is needed before checkout, otherwise there is no .git (and no tags for the version).
+      - name: Install git
+        run: |
+          apt-get update -q
+          apt-get install -y -q --no-install-recommends git ca-certificates
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # tags are needed for the version in the file name
+
+      - name: Install build dependencies
+        run: |
+          apt-get install -y -q --no-install-recommends \
+            build-essential cmake curl file patchelf squashfs-tools binutils \
+            librsvg2-bin desktop-file-utils libgl-dev \
+            qt6-base-dev qt6-tools-dev qt6-tools-dev-tools qt6-l10n-tools \
+            qt6-svg-dev libqt6svg6 qt6-wayland qt6-image-formats-plugins \
+            qt6-qpa-plugins qt6-gtk-platformtheme qt6-xdgdesktopportal-platformtheme \
+            qt6-translations-l10n
+
+      - name: Determine version
+        run: |
+          # Tagged commit (v1.2.3) → 1.2.3; otherwise <CMake version>-git<short hash>.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          CMAKE_VERSION="$(sed -n 's/^project([^)]*VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)"
+          if TAG="$(git describe --tags --exact-match 2>/dev/null)"; then
+            VERSION="${TAG#v}"
+          else
+            VERSION="$CMAKE_VERSION-git$(git rev-parse --short HEAD)"
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "Building qutaq-webapps $VERSION for $ARCH"
+
+      - name: Build and install into AppDir
+        run: |
+          rm -rf "$APPDIR"
+          cmake -S . -B "$BUILD_DIR/cmake" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -Wno-dev
+          cmake --build "$BUILD_DIR/cmake" -j"$(nproc)"
+          DESTDIR="$APPDIR" cmake --install "$BUILD_DIR/cmake"
+
+          BIN="$APPDIR/usr/bin/qutaq-webapps"
+          DESKTOP_SRC="$(ls "$APPDIR"/usr/share/applications/*.desktop | head -n1)"
+          APP_ID="$(basename "$DESKTOP_SRC" .desktop)"
+          ICON_SRC="$(ls "$APPDIR"/usr/share/icons/hicolor/*/apps/"$APP_ID".* | head -n1)"
+          [ -x "$BIN" ] && [ -f "$DESKTOP_SRC" ] && [ -f "$ICON_SRC" ] \
+            || { echo "Install step did not produce binary/desktop/icon" >&2; exit 1; }
+          { echo "BIN=$BIN"; echo "DESKTOP_SRC=$DESKTOP_SRC"; echo "APP_ID=$APP_ID"; echo "ICON_SRC=$ICON_SRC"; } >> "$GITHUB_ENV"
+
+      - name: Bundle Qt plugins and translations
+        run: |
+          QT_PLUGINS_SRC="$(dirname "$(dirname "$(find /usr/lib -path '*qt6/plugins/platforms/libqxcb.so' -print -quit)")")"
+          [ -d "$QT_PLUGINS_SRC/platforms" ] || { echo "Qt plugins not found" >&2; exit 1; }
+          echo "Qt plugins from $QT_PLUGINS_SRC"
+
+          PLUGINS_DST="$APPDIR/usr/plugins"
+          mkdir -p "$PLUGINS_DST"
+          copy_plugins() { # <category> [file-glob...]
+            local cat="$1"; shift
+            [ -d "$QT_PLUGINS_SRC/$cat" ] || return 0
+            local globs=("$@"); [ ${#globs[@]} -gt 0 ] || globs=("*.so")
+            mkdir -p "$PLUGINS_DST/$cat"
+            local g f
+            for g in "${globs[@]}"; do
+              for f in "$QT_PLUGINS_SRC/$cat"/$g; do
+                [ -f "$f" ] && cp -L "$f" "$PLUGINS_DST/$cat/"
+              done
+            done
+            rmdir --ignore-fail-on-non-empty "$PLUGINS_DST/$cat"
+          }
+          copy_plugins platforms libqxcb.so libqwayland-generic.so libqwayland-egl.so libqoffscreen.so
+          copy_plugins wayland-shell-integration
+          copy_plugins wayland-decoration-client
+          copy_plugins wayland-graphics-integration-client
+          copy_plugins xcbglintegrations
+          copy_plugins platforminputcontexts
+          copy_plugins platformthemes libqgtk3.so libqxdgdesktopportal.so
+          copy_plugins iconengines
+          copy_plugins imageformats
+          copy_plugins tls
+          copy_plugins networkinformation
+
+          mkdir -p "$APPDIR/usr/translations"
+          cp /usr/share/qt6/translations/qtbase_*.qm "$APPDIR/usr/translations/" 2>/dev/null || true
+
+          # qt.conf next to the binary: Qt looks for plugins/translations inside the AppImage.
+          printf '[Paths]\nPrefix = ..\nPlugins = plugins\nTranslations = translations\n' > "$APPDIR/usr/bin/qt.conf"
+
+      - name: Bundle shared libraries
+        run: |
+          # Libraries that must come from the host system: glibc, the C++ runtime,
+          # the graphics/display stack (drivers must match the host), fontconfig/freetype
+          # (tied to the host font config), glib/GTK (used only by the optional gtk3
+          # theme plugin), D-Bus, OpenSSL (loaded at runtime by Qt from the host).
+          # libOpenGL.so.0 (the tiny libglvnd OpenGL dispatcher) IS bundled: systems
+          # without other Qt 6 apps often lack it; it forwards to the host's
+          # libGLdispatch and driver. libp11-kit stays on the host: it loads the
+          # host's PKCS#11/trust modules.
+          EXCLUDE_RE='^(ld-linux.*|libc\.so.*|libm\.so.*|libdl\.so.*|libpthread\.so.*|librt\.so.*|libresolv\.so.*|libutil\.so.*|libanl\.so.*|libnsl\.so.*|libnss_.*|libmvec\.so.*|libBrokenLocale\.so.*|libthread_db\.so.*|libstdc\+\+\.so.*|libgcc_s\.so.*|libatomic\.so.*|libGL\.so.*|libGLX.*|libGLdispatch.*|libEGL.*|libGLES.*|libgbm\.so.*|libdrm.*|libvulkan.*|libwayland-.*|libX11\.so.*|libX11-xcb\.so.*|libxcb\.so.*|libXau\.so.*|libXdmcp\.so.*|libXext\.so.*|libXrender\.so.*|libXi\.so.*|libXfixes\.so.*|libXrandr\.so.*|libXcursor\.so.*|libXinerama\.so.*|libXcomposite\.so.*|libXdamage\.so.*|libICE\.so.*|libSM\.so.*|libfontconfig\.so.*|libfreetype\.so.*|libharfbuzz.*|libexpat\.so.*|libz\.so.*|libbz2\.so.*|libbrotli.*|libdbus-1\.so.*|libsystemd\.so.*|libudev\.so.*|libcap\.so.*|libselinux\.so.*|libmount\.so.*|libblkid\.so.*|libuuid\.so.*|libffi\.so.*|libglib-2\.0\.so.*|libgobject-2\.0\.so.*|libgio-2\.0\.so.*|libgmodule-2\.0\.so.*|libgthread-2\.0\.so.*|libgtk-3\.so.*|libgdk-3\.so.*|libgdk_pixbuf.*|libpango.*|libcairo.*|libatk.*|libatspi.*|libepoxy.*|libfribidi.*|libthai.*|libdatrie.*|libpixman.*|libssl\.so.*|libcrypto\.so.*|libgcrypt\.so.*|libp11-kit\.so.*|libgpg-error\.so.*|liblz4\.so.*|liblzma\.so.*|libzstd\.so.*|libpcre2-8\.so.*|libpng16\.so.*|libgraphite2\.so.*|libxkbcommon\.so.*|libbsd\.so.*|libmd\.so.*|libasound\.so.*|libpulse.*)$'
+
+          LIB_DST="$APPDIR/usr/lib"
+          PLUGINS_DST="$APPDIR/usr/plugins"
+          mkdir -p "$LIB_DST"
+          elf_files() { find "$APPDIR/usr/bin" "$APPDIR/usr/lib" "$APPDIR/usr/plugins" -type f \( -name '*.so*' -o -perm -u+x \) -exec sh -c 'file -L "$1" | grep -q ELF' _ {} \; -print; }
+
+          # Walk direct dependencies (DT_NEEDED) only, so that dependencies of excluded
+          # host libraries are never pulled in. ldd is used just to resolve file paths.
+          declare -A SEEN=()
+          queue=()
+          while IFS= read -r f; do queue+=("$f"); done < <(elf_files)
+          while [ ${#queue[@]} -gt 0 ]; do
+            elf="${queue[0]}"; queue=("${queue[@]:1}")
+            declare -A where=()
+            while read -r n _ p _; do [ -n "${p:-}" ] && where[$n]="$p"; done \
+              < <(LD_LIBRARY_PATH="$LIB_DST" ldd "$elf" 2>/dev/null | awk '$2=="=>" && $3 ~ /^\// {print $1, $2, $3}')
+            while IFS= read -r name; do
+              [[ "$name" =~ $EXCLUDE_RE ]] && continue
+              [ -n "${SEEN[$name]:-}" ] && continue
+              SEEN[$name]=1
+              path="${where[$name]:-}"
+              [ -n "$path" ] || { echo "Cannot resolve $name (needed by $elf)" >&2; exit 1; }
+              if [ ! -e "$LIB_DST/$name" ]; then
+                cp -L "$path" "$LIB_DST/$name"
+                queue+=("$LIB_DST/$name")
+              fi
+            done < <(readelf -d "$elf" 2>/dev/null | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p')
+            unset where
+          done
+          echo "Bundled $(ls "$LIB_DST" | wc -l) libraries:"
+          ls "$LIB_DST"
+
+          # RUNPATH: binary → usr/lib, libraries → themselves, plugins → ../../lib
+          patchelf --set-rpath '$ORIGIN/../lib' "$BIN"
+          for f in "$LIB_DST"/*; do patchelf --set-rpath '$ORIGIN' "$f"; done
+          find "$PLUGINS_DST" -name '*.so' -exec patchelf --set-rpath '$ORIGIN/../../lib' {} \;
+          find "$APPDIR/usr" -type f \( -name '*.so*' -o -path '*/bin/*' \) \
+            -exec sh -c 'file -L "$1" | grep -q "ELF.*not stripped"' _ {} \; \
+            -exec strip --strip-unneeded {} \; 2>/dev/null || true
+
+          # Libraries that are still unresolved (must be provided by the host).
+          missing="$(for f in $(elf_files); do ldd "$f" 2>/dev/null | grep 'not found' || true; done | sort -u)"
+          if [ -n "$missing" ]; then echo "Unresolved libraries:"; echo "$missing"; exit 1; fi
+
+          GLIBC_MIN="$(for f in $(elf_files); do objdump -T "$f" 2>/dev/null; done | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -n1 | sed 's/GLIBC_//')"
+          echo "Requires glibc >= $GLIBC_MIN"
+
+      - name: AppDir root (AppRun, desktop file, icons)
+        run: |
+          # AppRun: the entry point of the AppImage.
+          cat > "$APPDIR/AppRun" <<'EOF'
+          #!/bin/sh
+          # Entry point of the qutaq-webapps AppImage.
+          HERE="$(dirname "$(readlink -f "$0")")"
+          # Plugins of the host's Qt are built for a different Qt version and must not be
+          # loaded into the bundled one; the bundled plugins are found through qt.conf.
+          unset QT_PLUGIN_PATH QML2_IMPORT_PATH
+          exec "$HERE/usr/bin/qutaq-webapps" "$@"
+          EOF
+          chmod 755 "$APPDIR/AppRun"
+
+          cp "$DESKTOP_SRC" "$APPDIR/$APP_ID.desktop"
+          echo "X-AppImage-Version=$VERSION" >> "$APPDIR/$APP_ID.desktop"
+          desktop-file-validate "$APPDIR/$APP_ID.desktop"
+
+          ICON_EXT="${ICON_SRC##*.}"
+          cp "$ICON_SRC" "$APPDIR/$APP_ID.$ICON_EXT"
+          if [ "$ICON_EXT" = svg ]; then
+            rsvg-convert -w 256 -h 256 "$ICON_SRC" -o "$APPDIR/.DirIcon"
+          else
+            cp "$ICON_SRC" "$APPDIR/.DirIcon"
+          fi
+
+      - name: Create AppImage
+        run: |
+          RUNTIME="$BUILD_DIR/runtime-$ARCH"
+          curl -fsSL -o "$RUNTIME" "https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-$ARCH"
+          file -L "$RUNTIME" | grep -q ELF || { echo "Runtime download failed" >&2; exit 1; }
+
+          mkdir -p "$OUT_DIR"
+          OUT="$OUT_DIR/qutaq-webapps-$VERSION-$ARCH.AppImage"
+          rm -f "$BUILD_DIR/app.squashfs" "$OUT"
+          mksquashfs "$APPDIR" "$BUILD_DIR/app.squashfs" -root-owned -noappend -comp zstd -b 128K \
+            -mkfs-time "${SOURCE_DATE_EPOCH:-0}" -quiet
+          cat "$RUNTIME" "$BUILD_DIR/app.squashfs" > "$OUT"
+          chmod 755 "$OUT"
+          ( cd "$OUT_DIR" && sha256sum "$(basename "$OUT")" > "$(basename "$OUT").sha256" )
+          ls -lh "$OUT_DIR"
+          echo "APPIMAGE_FILE=$OUT" >> "$GITHUB_ENV"
+
+      - name: Smoke test
+        run: |
+          # No FUSE and no display in the container: extract-and-run + offscreen platform.
+          # The app must start and keep running (the event loop) until timeout kills it.
+          set +e
+          APPIMAGE_EXTRACT_AND_RUN=1 QT_QPA_PLATFORM=offscreen HOME="$RUNNER_TEMP/home" \
+            timeout 10 "$APPIMAGE_FILE" > smoke.log 2>&1
+          rc=$?
+          cat smoke.log
+          if [ "$rc" != 124 ]; then
+            echo "The AppImage exited with code $rc instead of running" >&2
+            exit 1
+          fi
+          echo "OK: the AppImage starts"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qutaq-webapps-${{ matrix.arch }}
+          path: |
+            dist/*.AppImage
+            dist/*.AppImage.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          ls -l dist
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" \
+              --title "Qutaq Web App Manager ${TAG#v}" --generate-notes
+          fi
