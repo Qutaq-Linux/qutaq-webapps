@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Логотип Qutaq Web App Manager (заглушка). Замените этот файл своим логотипом:
+     SVG (желательно, квадратный viewBox) или задайте PNG через -DQUTAQ_ICON=… -->
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3a8fd9"/>
+      <stop offset="1" stop-color="#1f5fa8"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="112" height="112" rx="24" fill="url(#bg)"/>
+  <!-- окно браузера -->
+  <rect x="24" y="30" width="80" height="68" rx="8" fill="#ffffff"/>
+  <path d="M24 38a8 8 0 0 1 8-8h64a8 8 0 0 1 8 8v8H24z" fill="#dce8f5"/>
+  <circle cx="33" cy="38" r="3" fill="#e5534b"/>
+  <circle cx="42" cy="38" r="3" fill="#e9b949"/>
+  <circle cx="51" cy="38" r="3" fill="#57ab5a"/>
+  <!-- плитки приложений -->
+  <rect x="36" y="54" width="24" height="16" rx="4" fill="#3a8fd9"/>
+  <rect x="68" y="54" width="24" height="16" rx="4" fill="#57ab5a"/>
+  <rect x="36" y="76" width="24" height="16" rx="4" fill="#e9b949"/>
+  <rect x="68" y="76" width="24" height="16" rx="4" fill="#e5534b"/>
+</svg>
